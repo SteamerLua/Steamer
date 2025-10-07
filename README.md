@@ -1,9 +1,8 @@
 # Steamer
 
 <p align="center">
-  <img src="images/Steamer.png" width="480" alt="Steamer logo">
+  <img src="images/Steamer.png" alt="IshtarRF logo" width="96" />
 </p>
-
 **Steamer** is an open-source desktop tool for Windows that helps you:
 
 * **Inject** game `.lua` files into Steam’s config folder in a clean, canonical format
