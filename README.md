@@ -15,7 +15,13 @@ Steamer is an open-source desktop tool for Windows that helps you:
 > **Educational use only.** This project is provided for learning and research. You are solely responsible for how you use it. Respect Steam/Valve terms and applicable laws. The maintainers do **not** endorse misuse.
 
 ---
+## Community & Support
 
+- 💬 **Discord:** [Join our server](https://discord.gg/kzRmTHaceS)
+- 🐞 **Issues:** Please use GitHub Issues for bug reports and feature requests.
+
+> Quick help, discussions, and previews happen on Discord. Come say hi!
+---
 ## Features
 
 * 🗂️ **Drag & Drop** or **Browse** to add `.lua` files
