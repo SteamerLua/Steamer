@@ -41,15 +41,22 @@ STEAMDB_DEPOT_URL = "https://steamdb.info/depot/{depot}/manifests/"
 # App icon (optional): place steamer.ico next to this file
 ICON_FILE = "steamer.ico"
 
-# ============================ Icon Helpers ============================
+# ============================ Icon / Path Helpers ============================
 
 from PyQt6 import QtGui  # noqa: E402
 
 
 def resource_path(rel: str) -> Path:
-    """Supports normal execution and PyInstaller bundles."""
+    """Supports normal execution and PyInstaller onefile bundles (_MEIPASS)."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / rel
+
+
+def get_app_dir() -> Path:
+    """Keep app data (DB/archives) next to the executable when frozen."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def get_app_icon() -> QtGui.QIcon:
@@ -147,11 +154,14 @@ def archive_final_copy(src_final_path: Path, archive_dir: Path) -> Path:
     return archive_path
 
 
+# -------- Robust patterns: accept 0|1 flag and optional ',0' ----------
 RE_ADDAPPID_TOKEN = re.compile(
-    r'addappid\(\s*(\d+)\s*,\s*1\s*,\s*"([^"]+)"\s*\)', re.IGNORECASE
+    r'addappid\(\s*(\d+)\s*,\s*(?:0|1)\s*,\s*"([^"]+)"\s*\)',
+    re.IGNORECASE,
 )
 RE_SETMANIFEST = re.compile(
-    r'setManifestid\(\s*(\d+)\s*,\s*"(\d+)"\s*,\s*0\s*\)', re.IGNORECASE
+    r'setManifestid\(\s*(\d+)\s*,\s*"(\d+)"(?:\s*,\s*0)?\s*\)',
+    re.IGNORECASE,
 )
 RE_ADDAPPID_SINGLE = re.compile(r'addappid\(\s*(\d+)\s*\)(?!\s*,)', re.IGNORECASE)
 
@@ -163,63 +173,111 @@ def infer_appid_from_filename(path: Path) -> int:
     return int(m.group(0))
 
 
-def parse_from_content(text: str) -> Dict[str, object]:
+def parse_all_from_content(text: str) -> Dict[str, object]:
     """
-    Extract appid (single-arg addappid), depot/token (multi-arg addappid),
-    and depot/manifest_id (setManifestid).
+    Extract:
+      - appid from addappid(APPID)
+      - tokens map: depot -> token from addappid(DEPOT, 0|1, "TOKEN")
+      - manifests map: depot -> manifest_id from setManifestid(DEPOT, "MID"[, 0])
     """
-    out: Dict[str, object] = {}
+    out: Dict[str, object] = {"appid": None, "tokens": {}, "manifests": {}}
 
     m = RE_ADDAPPID_SINGLE.search(text)
     if m:
         out["appid"] = int(m.group(1))
 
-    m = RE_ADDAPPID_TOKEN.search(text)
-    if m:
-        out["depot"] = int(m.group(1))
-        out["token"] = m.group(2)
+    tokens = {int(d): t for d, t in RE_ADDAPPID_TOKEN.findall(text)}
+    manifests = {int(d): mid for d, mid in RE_SETMANIFEST.findall(text)}
 
-    m = RE_SETMANIFEST.search(text)
-    if m:
-        out["depot"] = int(m.group(1))
-        out["manifest_id"] = m.group(2)
-
+    out["tokens"] = tokens
+    out["manifests"] = manifests
     return out
 
 
 def load_sidecar_json(stem: str, folder: Path) -> Dict[str, object]:
     """
-    Read <stem>.json next to the Lua file if present.
-    Expected keys: depot (int), token (str), manifest_id (str), appid (int, optional).
+    Read <stem>.json if present.
+    Supports either single-depot form:
+      {"appid": 123, "depot": 526871, "token": "...", "manifest_id": "..."}
+    or multi-depot form:
+      {"appid": 123, "depots": [{"depot":526871,"token":"...","manifest_id":"..."}, ...]}
+      {"appid": 123, "depots": {"526871":{"token":"...","manifest_id":"..."}, ...}}
+    Returns: {"appid": Optional[int], "tokens": {depot:int->token}, "manifests": {depot:int->manifest}}
     """
     cfg = folder / f"{stem}.json"
+    result: Dict[str, object] = {"appid": None, "tokens": {}, "manifests": {}}
     if not cfg.exists():
-        return {}
+        return result
     try:
         with cfg.open("r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {}
-        sanitized: Dict[str, object] = {}
+            return result
+
         if "appid" in data:
-            sanitized["appid"] = int(data["appid"])
+            result["appid"] = int(data["appid"])
+
+        tokens: Dict[int, str] = {}
+        manifests: Dict[int, str] = {}
+
+        # single-depot
         if "depot" in data:
-            sanitized["depot"] = int(data["depot"])
-        if "token" in data:
-            sanitized["token"] = str(data["token"])
-        if "manifest_id" in data:
-            sanitized["manifest_id"] = str(data["manifest_id"])
-        return sanitized
+            d = int(data["depot"])
+            if "token" in data:
+                tokens[d] = str(data["token"])
+            if "manifest_id" in data:
+                manifests[d] = str(data["manifest_id"])
+
+        # list form
+        if isinstance(data.get("depots"), list):
+            for item in data["depots"]:
+                try:
+                    d = int(item.get("depot"))
+                except Exception:
+                    continue
+                if "token" in item:
+                    tokens[d] = str(item["token"])
+                if "manifest_id" in item:
+                    manifests[d] = str(item["manifest_id"])
+
+        # dict form
+        if isinstance(data.get("depots"), dict):
+            for k, item in data["depots"].items():
+                try:
+                    d = int(k)
+                except Exception:
+                    continue
+                if "token" in item:
+                    tokens[d] = str(item["token"])
+                if "manifest_id" in item:
+                    manifests[d] = str(item["manifest_id"])
+
+        result["tokens"] = tokens
+        result["manifests"] = manifests
+        return result
     except Exception:
-        return {}
+        return result
 
 
-def build_lua_content(appid: int, depot: int, token: str, manifest_id: str) -> str:
-    return (
-        f"addappid({appid})\n"
-        f'addappid({depot},1,"{token}")\n'
-        f'setManifestid({depot},"{manifest_id}",0)\n'
-    )
+def build_lua_content_multi(appid: int, tokens: Dict[int, str], manifests: Dict[int, str]) -> str:
+    """
+    Canonical content:
+      addappid(APPID)
+      addappid(DEPOT,1,"TOKEN")   # only if token is known
+      setManifestid(DEPOT,"MID",0)  # if manifest known (even if token missing)
+    """
+    lines: List[str] = []
+    lines.append(f"addappid({appid})")
+    all_depots = sorted(set(tokens.keys()) | set(manifests.keys()))
+    for d in all_depots:
+        tok = tokens.get(d)
+        if tok:
+            lines.append(f'addappid({d},1,"{tok}")')
+    for d in all_depots:
+        mid = manifests.get(d)
+        if mid:
+            lines.append(f'setManifestid({d},"{mid}",0)')
+    return "\n".join(lines) + "\n"
 
 
 # -------------------- SQLite --------------------
@@ -239,16 +297,30 @@ def open_db(db_path: Path) -> sqlite3.Connection:
         );
         """
     )
+    # Migration: add 'multi' column if missing (0/1)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(gamesAdded)").fetchall()}
+        if "multi" not in cols:
+            conn.execute("ALTER TABLE gamesAdded ADD COLUMN multi INTEGER DEFAULT 0;")
+            conn.commit()
+    except Exception:
+        pass
     conn.commit()
     return conn
 
 
 def record_in_db(
-    conn: sqlite3.Connection, filename: str, appid: int, depot: int, manifest_id: str, dest_path: Path
+    conn: sqlite3.Connection,
+    filename: str,
+    appid: int,
+    depot: int,
+    manifest_id: str,
+    dest_path: Path,
+    multi: int = 0,
 ) -> None:
     conn.execute(
-        "INSERT INTO gamesAdded (filename, appid, depot, manifest_id, dest_path) VALUES (?, ?, ?, ?, ?);",
-        (filename, appid, depot, manifest_id, str(dest_path)),
+        "INSERT INTO gamesAdded (filename, appid, depot, manifest_id, dest_path, multi) VALUES (?, ?, ?, ?, ?, ?);",
+        (filename, appid, depot, manifest_id, str(dest_path), int(multi)),
     )
     conn.commit()
 
@@ -257,14 +329,14 @@ def load_latest_rows(conn: sqlite3.Connection) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT filename, appid, depot, manifest_id, dest_path, moved_at
+        SELECT filename, appid, depot, manifest_id, dest_path, moved_at, multi
         FROM gamesAdded
         ORDER BY moved_at ASC
         """
     )
     rows = cur.fetchall()
     latest: Dict[Tuple[str, int], dict] = {}
-    for filename, appid, depot, manifest_id, dest_path, moved_at in rows:
+    for filename, appid, depot, manifest_id, dest_path, moved_at, multi in rows:
         latest[(filename, int(depot))] = {
             "filename": filename,
             "appid": int(appid),
@@ -272,23 +344,40 @@ def load_latest_rows(conn: sqlite3.Connection) -> List[dict]:
             "manifest_id": str(manifest_id),
             "dest_path": str(dest_path),
             "moved_at": str(moved_at),
+            "multi": int(multi) if multi is not None else 0,
         }
     return list(latest.values())
 
 
-def update_db_manifest(conn: sqlite3.Connection, filename: str, depot: int, new_manifest: str) -> None:
+def load_known_files(conn: sqlite3.Connection) -> List[dict]:
+    """
+    Unique files we know about from DB (for worker to parse all depots directly from file).
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT filename, dest_path
+        FROM gamesAdded
+        ORDER BY moved_at DESC
+        """
+    )
+    return [{"filename": fn, "dest_path": dp} for (fn, dp) in cur.fetchall()]
+
+
+def update_db_manifest(conn: sqlite3.Connection, filename: str, depot: int, new_manifest: str) -> int:
     cur = conn.cursor()
     cur.execute(
         "UPDATE gamesAdded SET manifest_id = ? WHERE filename = ? AND depot = ?",
         (new_manifest, filename, depot),
     )
     conn.commit()
+    return cur.rowcount
 
 
 def update_lua_manifest(file_path: Path, depot: int, new_manifest: str) -> bool:
     """
-    Replace setManifestid(<depot>,"OLD",0) with setManifestid(<depot>,"NEW",0)
-    using a safe regex (no backref confusion).
+    Replace setManifestid(<depot>,"OLD"[ ,0]) with setManifestid(<depot>,"NEW",0)
+    Accepts lines with or without ',0'. Writes with ',0' canonicalized.
     """
     if not file_path.exists():
         return False
@@ -297,20 +386,22 @@ def update_lua_manifest(file_path: Path, depot: int, new_manifest: str) -> bool:
     except Exception:
         return False
 
+    # Anchored multiline
     pattern = re.compile(
-        rf'(?im)^(\s*setManifestid\(\s*{depot}\s*,\s*")(\d+)("\s*,\s*0\s*\)\s*)$'
+        rf'(?im)^(\s*setManifestid\(\s*{depot}\s*,\s*")(\d+)("\s*(?:,\s*0)?\s*\)\s*)$'
     )
 
-    def repl(m: re.Match) -> str:
-        return f'{m.group(1)}{new_manifest}{m.group(3)}'
+    def repl(m):
+        return f'{m.group(1)}{new_manifest}","0")'.replace('","0")','",0)')  # ensure ,0
 
     new_text, n = pattern.subn(repl, text)
     if n == 0:
+        # Loose single replacement
         pattern2 = re.compile(
-            rf'(setManifestid\(\s*{depot}\s*,\s*")(\d+)("\s*,\s*0\s*\))',
+            rf'(setManifestid\(\s*{depot}\s*,\s*")(\d+)("\s*(?:,\s*0)?\s*\))',
             re.IGNORECASE,
         )
-        new_text, n = pattern2.subn(repl, text, count=1)
+        new_text, n = pattern2.subn(lambda m: f'{m.group(1)}{new_manifest}",0)', text, count=1)
         if n == 0:
             return False
 
@@ -455,9 +546,11 @@ def run_check_worker_cli() -> None:
         return parse_latest_manifest_id(html)
 
     conn = open_db(db_path)
-    rows = load_latest_rows(conn)
-    if not rows:
-        print("[INFO] gamesAdded is empty.", file=sys.stderr, flush=True)
+
+    # Use unique file list; then parse ALL depots from each file itself
+    files = load_known_files(conn)
+    if not files:
+        print("[INFO] No known files in DB (gamesAdded is empty).", file=sys.stderr, flush=True)
         print("[]")
         conn.close()
         return
@@ -470,46 +563,66 @@ def run_check_worker_cli() -> None:
         inject_cookies_if_any(driver)
         checked = errors = 0
 
-        for row in rows:
-            checked += 1
-            filename = row["filename"]
-            depot = row["depot"]
-            current_manifest = row["manifest_id"]
-            dest_path = Path(row["dest_path"])
+        for file_row in files:
+            filename = file_row["filename"]
+            dest_path = Path(file_row["dest_path"])
             lua_file = dest_path / filename
+            if not lua_file.exists():
+                print(f"[MISSING] {lua_file}", file=sys.stderr, flush=True)
+                continue
+
             try:
-                latest_manifest = get_latest_manifest_for_depot(driver, depot)
+                text = lua_file.read_text(encoding="utf-8", errors="ignore")
             except Exception as e:
-                print(f"[CHECK ERROR] depot {depot} ({filename}): {e}", file=sys.stderr, flush=True)
-                errors += 1
+                print(f"[READ ERROR] {lua_file}: {e}", file=sys.stderr, flush=True)
                 continue
 
-            if not latest_manifest:
-                print(f"[NO DATA] depot {depot} ({filename})", file=sys.stderr, flush=True)
+            parsed = parse_all_from_content(text)
+            appid = int(parsed.get("appid") or 0)
+            manifests: Dict[int, str] = parsed.get("manifests", {})  # type: ignore[assignment]
+            if not manifests:
+                print(f"[NO MANIFESTS] {filename}", file=sys.stderr, flush=True)
                 continue
 
-            if latest_manifest != current_manifest:
-                to_update.append(
-                    {
-                        "filename": filename,
-                        "depot": depot,
-                        "current_manifest": current_manifest,
-                        "latest_manifest": latest_manifest,
-                        "lua_path": str(lua_file),
-                        "dest_path": str(dest_path),
-                    }
-                )
-                print(
-                    f"[UPDATE] {filename} depot {depot}: {current_manifest} -> {latest_manifest}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[OK] {filename} depot {depot}: up-to-date ({current_manifest})",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            multi = 1 if len(manifests) > 1 else 0
+
+            for depot, current_manifest in sorted(manifests.items()):
+                checked += 1
+                try:
+                    latest_manifest = get_latest_manifest_for_depot(driver, depot)
+                except Exception as e:
+                    print(f"[CHECK ERROR] {filename} depot {depot}: {e}", file=sys.stderr, flush=True)
+                    errors += 1
+                    continue
+
+                if not latest_manifest:
+                    print(f"[NO DATA] depot {depot} ({filename})", file=sys.stderr, flush=True)
+                    continue
+
+                if latest_manifest != current_manifest:
+                    to_update.append(
+                        {
+                            "filename": filename,
+                            "appid": appid,
+                            "multi": multi,
+                            "depot": depot,
+                            "current_manifest": current_manifest,
+                            "latest_manifest": latest_manifest,
+                            "lua_path": str(lua_file),
+                            "dest_path": str(dest_path),
+                        }
+                    )
+                    print(
+                        f"[UPDATE] {filename} depot {depot}: {current_manifest} -> {latest_manifest}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[OK] {filename} depot {depot}: up-to-date ({current_manifest})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
         print(
             f"[CHECK DONE] checked={checked}, updates={len(to_update)}, errors={errors}",
@@ -641,42 +754,59 @@ class InjectWorker(QtCore.QRunnable):
                 except Exception:
                     original_text = ""
 
-                parsed = parse_from_content(original_text)
+                parsed = parse_all_from_content(original_text)
                 sidecar = load_sidecar_json(src.stem, src.parent)
 
-                appid = sidecar.get("appid", parsed.get("appid", None))  # type: ignore[arg-type]
-                if appid is None:
-                    appid = infer_appid_from_filename(src)
+                # appid
+                appid = sidecar.get("appid") or parsed.get("appid")
+                if not appid:
+                    try:
+                        appid = infer_appid_from_filename(src)
+                    except Exception:
+                        appid = 0
+                appid = int(appid or 0)
 
-                depot = sidecar.get("depot", parsed.get("depot", None))  # type: ignore[arg-type]
-                token = sidecar.get("token", parsed.get("token", None))  # type: ignore[arg-type]
-                manifest_id = sidecar.get("manifest_id", parsed.get("manifest_id", None))  # type: ignore[arg-type]
+                # merge tokens/manifests
+                tokens: Dict[int, str] = dict(parsed.get("tokens", {}))  # type: ignore[assignment]
+                manifests: Dict[int, str] = dict(parsed.get("manifests", {}))  # type: ignore[assignment]
+                tokens.update(sidecar.get("tokens", {}))       # type: ignore[arg-type]
+                manifests.update(sidecar.get("manifests", {})) # type: ignore[arg-type]
 
-                missing = [
-                    k
-                    for k, v in (("depot", depot), ("token", token), ("manifest_id", manifest_id))
-                    if v in (None, "")
-                ]
-                if missing:
+                all_depots = sorted(set(tokens.keys()) | set(manifests.keys()))
+                if not all_depots:
                     self.log.message.emit(
-                        f"[SKIP] {src.name}: missing {', '.join(missing)} "
-                        f"(provide in file content or {src.stem}.json)"
+                        f"[SKIP] {src.name}: no depot/manifest found (provide data in file or {src.stem}.json)"
                     )
                     skipped += 1
                     continue
 
+                # Build canonical content but keep manifests even without token
+                new_content = build_lua_content_multi(appid, tokens, manifests)
+                # Move, then write
                 final_path = backup_then_move(src, dest_dir)
-                new_content = build_lua_content(int(appid), int(depot), str(token), str(manifest_id))
                 final_path.write_text(new_content, encoding="utf-8")
 
+                # Archive final
                 archived_path = archive_final_copy(final_path, archive_dir)
                 self.log.message.emit(f"[ARCHIVE] {archived_path.name}")
 
-                record_in_db(conn, final_path.name, int(appid), int(depot), str(manifest_id), dest_dir)
-                self.log.message.emit(f"[INJECTED] {final_path.name} -> {dest_dir}")
+                # DB: one row per depot that has a manifest
+                multi_flag = 1 if len([d for d in all_depots if d in manifests]) > 1 else 0
+                inserted_any = False
+                for d in all_depots:
+                    mid = manifests.get(d)
+                    if not mid:
+                        self.log.message.emit(f"[WARN] {final_path.name} depot {d}: missing token or manifest; kept manifest line only.")
+                        continue
+                    record_in_db(conn, final_path.name, int(appid), int(d), str(mid), dest_dir, multi=multi_flag)
+                    inserted_any = True
+                    self.log.message.emit(f"[INJECTED] {final_path.name} -> depot {d} (manifest {mid})")
 
-                moved += 1
-                archived += 1
+                if inserted_any:
+                    moved += 1
+                    archived += 1
+                else:
+                    self.log.message.emit(f"[SKIP] {final_path.name}: no complete depots to record.")
 
             except PermissionError:
                 self.log.message.emit(f"[ERROR] Permission denied: {src.name} (run as Administrator).")
@@ -713,16 +843,21 @@ class UpdateApplyWorker(QtCore.QRunnable):
 
         for item in self.updates:
             filename = item["filename"]
+            appid = int(item.get("appid", 0))
+            multi = int(item.get("multi", 0))
             depot = int(item["depot"])
             new_manifest = str(item["latest_manifest"])
+            dest_path = Path(item["dest_path"])
             lua_path = Path(item["lua_path"])
 
             ok_file = update_lua_manifest(lua_path, depot, new_manifest)
             ok_db = False
-
             if ok_file:
                 try:
-                    update_db_manifest(conn, filename, depot, new_manifest)
+                    affected = update_db_manifest(conn, filename, depot, new_manifest)
+                    if affected == 0:
+                        # Create missing DB row for this depot
+                        record_in_db(conn, filename, appid, depot, new_manifest, dest_path, multi=multi)
                     ok_db = True
                 except Exception as e:
                     self.log.message.emit(f"[DB ERROR] {filename} (depot {depot}): {e}")
@@ -744,7 +879,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(980, 640)
 
-        self.app_dir = Path(__file__).resolve().parent
+        # Keep app data next to EXE, not in _MEI temp
+        self.app_dir = get_app_dir()
+
         self.app_icon = get_app_icon()
         if not self.app_icon.isNull():
             self.setWindowIcon(self.app_icon)
@@ -814,7 +951,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.checkBtn.setIcon(self.app_icon if not self.app_icon.isNull() else check_fallback)
         self.checkBtn.clicked.connect(self.check_updates_clicked)
 
-        # NEW: Find Steam Path button
+        # Find Steam Path button
         self.locateBtn = QtWidgets.QPushButton("Find Steam Path")
         self.locateBtn.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirIcon))
         self.locateBtn.clicked.connect(self.locate_steam_path)
@@ -824,7 +961,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         btnRow.addWidget(self.injectBtn)
         btnRow.addWidget(self.checkBtn)
-        btnRow.addWidget(self.locateBtn)   # ← added button
+        btnRow.addWidget(self.locateBtn)
         btnRow.addStretch(1)
         btnRow.addWidget(openDbBtn)
         layout.addLayout(btnRow)
@@ -921,7 +1058,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def check_updates_clicked(self):
         """
-        Spawn child process: python main.py --check-worker --db <path>
+        Start same EXE with worker flag:  <exe> --check-worker --db <path>
+        DB is ensured next to the EXE (self.app_dir).
         """
         self.append_log("[CHECK] launching worker subprocess…")
         if self.proc and self.proc.state() != QtCore.QProcess.ProcessState.NotRunning:
@@ -929,13 +1067,29 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         db_path = self.app_dir / DB_NAME
+
+        # Ensure DB exists (create schema if missing)
         if not db_path.exists():
-            QtWidgets.QMessageBox.warning(self, "Missing DB", f"Database not found:\n{db_path}")
-            return
+            try:
+                conn = open_db(db_path)
+                conn.close()
+                self.append_log(f"[INFO] Created new DB at {db_path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "DB Error", f"Could not create DB:\n{e}")
+                return
 
         self.proc = QtCore.QProcess(self)
-        self.proc.setProgram(sys.executable)
-        self.proc.setArguments([str(Path(__file__).resolve()), "--check-worker", "--db", str(db_path)])
+
+        if getattr(sys, "frozen", False):
+            program = sys.executable
+            args = ["--check-worker", "--db", str(db_path)]
+        else:
+            program = sys.executable
+            script = Path(__file__).resolve()
+            args = [str(script), "--check-worker", "--db", str(db_path)]
+
+        self.proc.setProgram(program)
+        self.proc.setArguments(args)
         self.proc.setWorkingDirectory(str(self.app_dir))
         self.proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.SeparateChannels)
         self.proc.readyReadStandardError.connect(self._proc_read_stderr)
