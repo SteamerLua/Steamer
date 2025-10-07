@@ -3,7 +3,7 @@
 <p align="center">
   <img src="images/Steamer.png" alt="IshtarRF logo" width="96" />
 </p>
-**Steamer** is an open-source desktop tool for Windows that helps you:
+Steamer is an open-source desktop tool for Windows that helps you:
 
 * **Inject** game `.lua` files into Steam’s config folder in a clean, canonical format
 * **Track & update** games by replacing the **ManifestID** when a newer one appears
