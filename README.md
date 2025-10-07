@@ -18,7 +18,6 @@ Steamer is an open-source desktop tool for Windows that helps you:
 ## Community & Support
 
 - 💬 **Discord:** [Join our server](https://discord.gg/kzRmTHaceS)
-- 🐞 **Issues:** Please use GitHub Issues for bug reports and feature requests.
 
 > Quick help, discussions, and previews happen on Discord. Come say hi!
 ---
