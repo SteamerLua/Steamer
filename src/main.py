@@ -125,26 +125,36 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def backup_then_move(src: Path, dest_dir: Path) -> Path:
+def copy_with_backup(src: Path, dest_dir: Path) -> Path:
     """
-    Move src into dest_dir. If target exists, rename it to *.backup / *.backup.N first.
+    Copy src into dest_dir WITHOUT modifying the original file.
+    - If src is already inside dest_dir → do nothing and return the same path.
+    - If target exists, rename it to *.backup / *.backup.N first, then copy.
     Returns the final target path inside dest_dir.
     """
+    dest_dir = dest_dir.resolve()
+    src = src.resolve()
+
+    # Already in destination → nothing to copy/overwrite
+    if src.parent.resolve() == dest_dir:
+        return src
+
     target = dest_dir / src.name
     if target.exists():
-        backup = dest_dir / f"{src.stem}.backup{target.suffix}"
+        backup = dest_dir / f"{src.stem}.backup{src.suffix}"
         idx = 1
         while backup.exists():
-            backup = dest_dir / f"{src.stem}.backup.{idx}{target.suffix}"
+            backup = dest_dir / f"{src.stem}.backup.{idx}{src.suffix}"
             idx += 1
         target.replace(backup)
-    shutil.move(str(src), str(dest_dir))
-    return dest_dir / src.name
+
+    shutil.copy2(str(src), str(target))
+    return target
 
 
 def archive_final_copy(src_final_path: Path, archive_dir: Path) -> Path:
     """
-    Copy the FINAL Lua file (after rewrite) into archive_dir with a timestamped name.
+    Copy the FINAL Lua file (as injected) into archive_dir with a timestamped name.
     """
     ensure_dir(archive_dir)
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -154,13 +164,14 @@ def archive_final_copy(src_final_path: Path, archive_dir: Path) -> Path:
     return archive_path
 
 
-# -------- Robust patterns: accept 0|1 flag and optional ',0' ----------
+# -------- Robust patterns: accept 0|1 flag and any trailing args in setManifestid ----------
 RE_ADDAPPID_TOKEN = re.compile(
     r'addappid\(\s*(\d+)\s*,\s*(?:0|1)\s*,\s*"([^"]+)"\s*\)',
     re.IGNORECASE,
 )
+# Accepts: setManifestid(DEPOT,"MID") or setManifestid(DEPOT,"MID",0) or setManifestid(DEPOT,"MID",ANYTHING)
 RE_SETMANIFEST = re.compile(
-    r'setManifestid\(\s*(\d+)\s*,\s*"(\d+)"(?:\s*,\s*0)?\s*\)',
+    r'setManifestid\(\s*(\d+)\s*,\s*"(\d+)"(?:\s*,\s*[^)]*)?\s*\)',
     re.IGNORECASE,
 )
 RE_ADDAPPID_SINGLE = re.compile(r'addappid\(\s*(\d+)\s*\)(?!\s*,)', re.IGNORECASE)
@@ -178,7 +189,7 @@ def parse_all_from_content(text: str) -> Dict[str, object]:
     Extract:
       - appid from addappid(APPID)
       - tokens map: depot -> token from addappid(DEPOT, 0|1, "TOKEN")
-      - manifests map: depot -> manifest_id from setManifestid(DEPOT, "MID"[, 0])
+      - manifests map: depot -> manifest_id from setManifestid(DEPOT, "MID", ANY)
     """
     out: Dict[str, object] = {"appid": None, "tokens": {}, "manifests": {}}
 
@@ -195,79 +206,23 @@ def parse_all_from_content(text: str) -> Dict[str, object]:
 
 
 def load_sidecar_json(stem: str, folder: Path) -> Dict[str, object]:
-    """
-    Read <stem>.json if present.
-    Supports either single-depot form:
-      {"appid": 123, "depot": 526871, "token": "...", "manifest_id": "..."}
-    or multi-depot form:
-      {"appid": 123, "depots": [{"depot":526871,"token":"...","manifest_id":"..."}, ...]}
-      {"appid": 123, "depots": {"526871":{"token":"...","manifest_id":"..."}, ...}}
-    Returns: {"appid": Optional[int], "tokens": {depot:int->token}, "manifests": {depot:int->manifest}}
-    """
+
     cfg = folder / f"{stem}.json"
-    result: Dict[str, object] = {"appid": None, "tokens": {}, "manifests": {}}
+    result: Dict[str, object] = {"appid": None}
     if not cfg.exists():
         return result
     try:
         with cfg.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict):
-            return result
-
-        if "appid" in data:
+        if isinstance(data, dict) and "appid" in data:
             result["appid"] = int(data["appid"])
-
-        tokens: Dict[int, str] = {}
-        manifests: Dict[int, str] = {}
-
-        # single-depot
-        if "depot" in data:
-            d = int(data["depot"])
-            if "token" in data:
-                tokens[d] = str(data["token"])
-            if "manifest_id" in data:
-                manifests[d] = str(data["manifest_id"])
-
-        # list form
-        if isinstance(data.get("depots"), list):
-            for item in data["depots"]:
-                try:
-                    d = int(item.get("depot"))
-                except Exception:
-                    continue
-                if "token" in item:
-                    tokens[d] = str(item["token"])
-                if "manifest_id" in item:
-                    manifests[d] = str(item["manifest_id"])
-
-        # dict form
-        if isinstance(data.get("depots"), dict):
-            for k, item in data["depots"].items():
-                try:
-                    d = int(k)
-                except Exception:
-                    continue
-                if "token" in item:
-                    tokens[d] = str(item["token"])
-                if "manifest_id" in item:
-                    manifests[d] = str(item["manifest_id"])
-
-        result["tokens"] = tokens
-        result["manifests"] = manifests
-        return result
     except Exception:
-        return result
+        pass
+    return result
 
 
 def build_lua_content_multi(appid: int, tokens: Dict[int, str], manifests: Dict[int, str]) -> str:
-    """
-    Canonical content:
-      addappid(APPID)
-      addappid(DEPOT,1,"TOKEN")   # only if token is known
-      setManifestid(DEPOT,"MID",0)  # if manifest known (even if token missing)
-    """
-    lines: List[str] = []
-    lines.append(f"addappid({appid})")
+    lines: List[str] = [f"addappid({appid})"]
     all_depots = sorted(set(tokens.keys()) | set(manifests.keys()))
     for d in all_depots:
         tok = tokens.get(d)
@@ -376,8 +331,7 @@ def update_db_manifest(conn: sqlite3.Connection, filename: str, depot: int, new_
 
 def update_lua_manifest(file_path: Path, depot: int, new_manifest: str) -> bool:
     """
-    Replace setManifestid(<depot>,"OLD"[ ,0]) with setManifestid(<depot>,"NEW",0)
-    Accepts lines with or without ',0'. Writes with ',0' canonicalized.
+    Replace setManifestid(<depot>,"OLD",ANY) with setManifestid(<depot>,"NEW",0)
     """
     if not file_path.exists():
         return False
@@ -386,19 +340,17 @@ def update_lua_manifest(file_path: Path, depot: int, new_manifest: str) -> bool:
     except Exception:
         return False
 
-    # Anchored multiline
     pattern = re.compile(
-        rf'(?im)^(\s*setManifestid\(\s*{depot}\s*,\s*")(\d+)("\s*(?:,\s*0)?\s*\)\s*)$'
+        rf'(?im)^(\s*setManifestid\(\s*{depot}\s*,\s*")(\d+)(".*\)\s*)$'
     )
 
     def repl(m):
-        return f'{m.group(1)}{new_manifest}","0")'.replace('","0")','",0)')  # ensure ,0
+        return f'{m.group(1)}{new_manifest}",0)'
 
     new_text, n = pattern.subn(repl, text)
     if n == 0:
-        # Loose single replacement
         pattern2 = re.compile(
-            rf'(setManifestid\(\s*{depot}\s*,\s*")(\d+)("\s*(?:,\s*0)?\s*\))',
+            rf'(setManifestid\(\s*{depot}\s*,\s*")(\d+)(".*\))',
             re.IGNORECASE,
         )
         new_text, n = pattern2.subn(lambda m: f'{m.group(1)}{new_manifest}",0)', text, count=1)
@@ -716,7 +668,7 @@ class DropListWidget(QtWidgets.QListWidget):
 
 class InjectWorker(QtCore.QRunnable):
     """
-    Background worker to inject/move .lua files and log to DB.
+    Background worker to copy .lua files into Steam and log to DB WITHOUT modifying the content.
     """
 
     def __init__(self, files: List[Path], app_dir: Path, log: LogBus):
@@ -739,7 +691,7 @@ class InjectWorker(QtCore.QRunnable):
         ensure_dir(archive_dir)
 
         conn = open_db(self.app_dir / DB_NAME)
-        moved = skipped = errors = archived = 0
+        copied = skipped = errors = archived = 0
 
         for src in self.files:
             try:
@@ -757,8 +709,8 @@ class InjectWorker(QtCore.QRunnable):
                 parsed = parse_all_from_content(original_text)
                 sidecar = load_sidecar_json(src.stem, src.parent)
 
-                # appid
-                appid = sidecar.get("appid") or parsed.get("appid")
+                # appid (for DB only)
+                appid = parsed.get("appid") or sidecar.get("appid")
                 if not appid:
                     try:
                         appid = infer_appid_from_filename(src)
@@ -766,47 +718,27 @@ class InjectWorker(QtCore.QRunnable):
                         appid = 0
                 appid = int(appid or 0)
 
-                # merge tokens/manifests
-                tokens: Dict[int, str] = dict(parsed.get("tokens", {}))  # type: ignore[assignment]
                 manifests: Dict[int, str] = dict(parsed.get("manifests", {}))  # type: ignore[assignment]
-                tokens.update(sidecar.get("tokens", {}))       # type: ignore[arg-type]
-                manifests.update(sidecar.get("manifests", {})) # type: ignore[arg-type]
 
-                all_depots = sorted(set(tokens.keys()) | set(manifests.keys()))
-                if not all_depots:
-                    self.log.message.emit(
-                        f"[SKIP] {src.name}: no depot/manifest found (provide data in file or {src.stem}.json)"
-                    )
-                    skipped += 1
-                    continue
+                # Copy file to Steam (no edits)
+                final_path = copy_with_backup(src, dest_dir)
 
-                # Build canonical content but keep manifests even without token
-                new_content = build_lua_content_multi(appid, tokens, manifests)
-                # Move, then write
-                final_path = backup_then_move(src, dest_dir)
-                final_path.write_text(new_content, encoding="utf-8")
-
-                # Archive final
+                # Archive the injected copy
                 archived_path = archive_final_copy(final_path, archive_dir)
                 self.log.message.emit(f"[ARCHIVE] {archived_path.name}")
 
-                # DB: one row per depot that has a manifest
-                multi_flag = 1 if len([d for d in all_depots if d in manifests]) > 1 else 0
-                inserted_any = False
-                for d in all_depots:
-                    mid = manifests.get(d)
-                    if not mid:
-                        self.log.message.emit(f"[WARN] {final_path.name} depot {d}: missing token or manifest; kept manifest line only.")
-                        continue
-                    record_in_db(conn, final_path.name, int(appid), int(d), str(mid), dest_dir, multi=multi_flag)
-                    inserted_any = True
-                    self.log.message.emit(f"[INJECTED] {final_path.name} -> depot {d} (manifest {mid})")
-
-                if inserted_any:
-                    moved += 1
-                    archived += 1
+                if manifests:
+                    multi_flag = 1 if len(manifests) > 1 else 0
+                    for d, mid in sorted(manifests.items()):
+                        record_in_db(conn, final_path.name, int(appid), int(d), str(mid), dest_dir, multi=multi_flag)
+                        self.log.message.emit(f"[INJECTED] {final_path.name} -> depot {d} (manifest {mid})")
                 else:
-                    self.log.message.emit(f"[SKIP] {final_path.name}: no complete depots to record.")
+                    self.log.message.emit(
+                        f"[COPY] {final_path.name} copied (no setManifestid found — updater can’t track this file)."
+                    )
+
+                copied += 1
+                archived += 1
 
             except PermissionError:
                 self.log.message.emit(f"[ERROR] Permission denied: {src.name} (run as Administrator).")
@@ -817,7 +749,7 @@ class InjectWorker(QtCore.QRunnable):
 
         conn.close()
         self.log.message.emit(
-            f"\n[INJECT DONE] moved={moved}, archived={archived}, skipped={skipped}, errors={errors}"
+            f"\n[INJECT DONE] copied={copied}, archived={archived}, skipped={skipped}, errors={errors}"
         )
 
 
@@ -856,7 +788,6 @@ class UpdateApplyWorker(QtCore.QRunnable):
                 try:
                     affected = update_db_manifest(conn, filename, depot, new_manifest)
                     if affected == 0:
-                        # Create missing DB row for this depot
                         record_in_db(conn, filename, appid, depot, new_manifest, dest_path, multi=multi)
                     ok_db = True
                 except Exception as e:
@@ -1058,8 +989,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def check_updates_clicked(self):
         """
-        Start same EXE with worker flag:  <exe> --check-worker --db <path>
-        DB is ensured next to the EXE (self.app_dir).
+        Start same EXE with worker flag:
+          - Frozen (exe): <exe> --check-worker --db <path>
+          - Source:       python main.py --check-worker --db <path>
         """
         self.append_log("[CHECK] launching worker subprocess…")
         if self.proc and self.proc.state() != QtCore.QProcess.ProcessState.NotRunning:
